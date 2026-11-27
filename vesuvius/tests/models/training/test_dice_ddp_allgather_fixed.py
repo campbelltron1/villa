@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import faulthandler
 import os
+import sys
 import time
+import traceback
+from datetime import timedelta
 
 import pytest
 import torch
@@ -23,6 +27,8 @@ requires_gloo = pytest.mark.skipif(
 )
 
 WORLD = 2
+# A worker still running after this long prints its stack and exits, so a stuck
+# rendezvous or shutdown fails the test instead of holding CI until its 6 h limit.
 WORKER_TIMEOUT_S = 120
 LOSSES = {"soft": SoftDiceLoss, "memory_efficient": MemoryEfficientSoftDiceLoss}
 
@@ -49,8 +55,23 @@ def _model():
 
 
 def _worker(rank, name, init_file, out_prefix):
+    faulthandler.dump_traceback_later(WORKER_TIMEOUT_S, exit=True)
+    try:
+        _run_worker(rank, name, init_file, out_prefix)
+    except BaseException:
+        traceback.print_exc()
+        sys.stderr.flush()
+        os._exit(1)
+    # Leave without interpreter finalization. On the Linux CI runners a worker
+    # sometimes hung after its Python code had returned: faulthandler showed
+    # "<no Python frame>" in its only Python thread.
+    os._exit(0)
+
+
+def _run_worker(rank, name, init_file, out_prefix):
     dist.init_process_group(
-        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=WORLD
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=WORLD,
+        timeout=timedelta(seconds=60),
     )
     try:
         probabilities, labels = _batch()
@@ -61,12 +82,6 @@ def _worker(rank, name, init_file, out_prefix):
         torch.save({"loss": loss.detach(), "grad": model.module.weight.grad}, f"{out_prefix}.{rank}")
     finally:
         dist.destroy_process_group()
-    # Leave without interpreter shutdown. The gloo process group outlives
-    # destroy_process_group() and is freed during finalization, where Python
-    # 3.14 parks any gloo thread that asks for the GIL while it holds the
-    # group's lock; ~ProcessGroupGloo then waits on that lock forever and
-    # mp.spawn(join=True) never returns. The result is already on disk.
-    os._exit(0)
 
 
 @requires_gloo
@@ -84,12 +99,12 @@ def test_batch_dice_under_ddp_matches_one_process(tmp_path, name):
         nprocs=WORLD,
         join=False,
     )
-    deadline = time.monotonic() + WORKER_TIMEOUT_S
+    deadline = time.monotonic() + WORKER_TIMEOUT_S + 30
     while not context.join(timeout=1):
         if time.monotonic() > deadline:
             for process in context.processes:
                 process.kill()
-            pytest.fail(f"DDP workers did not exit within {WORKER_TIMEOUT_S} s")
+            pytest.fail(f"DDP workers still running after {WORKER_TIMEOUT_S + 30} s")
 
     for rank in range(WORLD):
         result = torch.load(f"{out_prefix}.{rank}")
