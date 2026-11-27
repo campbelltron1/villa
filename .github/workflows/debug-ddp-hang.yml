@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rep: [1, 2, 3]
+        rep: [1, 2]
     defaults:
       run:
         shell: bash
@@ -74,6 +74,8 @@ jobs:
             segmentation/models/arch/nnunet/pyproject.toml
 
       - name: Sync dependencies
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: '2'
         run: uv sync --extra all
 
       - name: Select Zarr version
@@ -83,27 +85,35 @@ jobs:
         run: |
           hostname; hostname -I || true; getent hosts "$(hostname)" || true; nproc; uv run --no-sync python -c "import sys,torch,multiprocessing as m;print(sys.version, torch.__version__, m.get_start_method())"
 
-      - name: CI-order tests up to the dice DDP test, with stack dumps on a stall
+      - name: Dice DDP test alone, 15 times each way, stack dumps on a hang
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          SPY="$(pwd)/.venv/bin/py-spy"
-          dump() { for p in $(pgrep -f -u "$USER" python); do echo "== pid $p ppid $(ps -o ppid= -p $p) :: $(tr '\0' ' ' < /proc/$p/cmdline | cut -c1-300)"; sudo "$SPY" dump --pid $p 2>&1 | head -80; done; }
-          ( sleep 300; if pgrep -f "pytest" >/dev/null; then echo "### dump at 300 s"; dump; fi; sleep 240; if pgrep -f "pytest" >/dev/null; then echo "### dump at 540 s"; dump; ps -eo pid,ppid,stat,etimes,wchan:24,cmd | grep -E "python|pytest" | cut -c1-250; fi ) > ../watchdog.txt 2>&1 &
           set +e
-          timeout 600 uv run --no-sync pytest tests/data/test_affine.py tests/data/test_cube.py tests/data/test_vc_dataset_bbox.py tests/data/test_zarr_chunk_index.py tests/fiber_spline_generator/test_cleanup.py tests/fiber_spline_generator/test_cli.py tests/fiber_spline_generator/test_predict.py tests/fiber_spline_generator/test_splines.py tests/fiber_spline_generator/test_stitch.py tests/fiber_spline_generator/test_store.py tests/ink_detection/test_checkpoint_foundation.py tests/ink_detection/test_compile_fallback.py tests/ink_detection/test_config_foundation.py tests/ink_detection/test_curation_preprocessing.py tests/ink_detection/test_data_foundation.py tests/ink_detection/test_dependency_wiring.py tests/ink_detection/test_dino_guided_training.py tests/ink_detection/test_dynamic_labels.py tests/ink_detection/test_flat_inference.py tests/ink_detection/test_flat_inference_empty_chunks.py tests/ink_detection/test_flat_inference_ensemble.py tests/ink_detection/test_heldout_validation.py tests/ink_detection/test_inference_boundaries.py tests/ink_detection/test_inference_mps_copy.py tests/ink_detection/test_isotropic_input_preparation.py tests/ink_detection/test_label_zarr_preprocessing.py tests/ink_detection/test_loss_foundation.py tests/ink_detection/test_model_foundation.py tests/ink_detection/test_native_full3d_inference.py tests/ink_detection/test_numerical_foundation.py tests/ink_detection/test_roi_inference.py tests/ink_detection/test_roi_output_metadata.py tests/ink_detection/test_shipped_configs.py tests/ink_detection/test_training_artifacts.py tests/ink_detection/test_training_config.py tests/ink_detection/test_training_mps_copy.py tests/ink_detection/test_training_numerics.py tests/ink_detection/test_volume_io.py tests/install/test_windows_torch_cuda_source.py tests/models/configuration/test_config_manager.py tests/models/configuration/test_ps256_config_compat.py tests/models/datasets/test_cross_frame_dataset.py tests/models/datasets/test_find_valid_patches_plain_array.py tests/models/run/test_blend_finalize_bit_identity.py tests/models/run/test_blend_finalize_pipeline.py tests/models/run/test_finalize_multiclass_scale.py tests/models/run/test_finalize_uncovered_voxels.py tests/models/run/test_in_memory_blend.py tests/models/run/test_inference_chunk_cache.py tests/models/run/test_inference_legacy_checkpoint.py tests/models/run/test_inference_nnunet_normalization.py tests/models/run/test_inference_non_cuda_devices.py tests/models/run/test_inference_run_config_attrs.py tests/models/run/test_lock_file_exclusive.py tests/models/run/test_patch_writer.py tests/models/run/test_pipeline_cli.py tests/models/test_augment_on_device.py tests/models/test_load_nnunet_model.py tests/models/test_mps_conv3d.py tests/models/training/test_base_trainer.py tests/models/training/test_cli_schedule_defaults.py tests/models/training/test_cross_frame_smoke.py tests/models/training/test_dice_ddp_allgather.py  -m "not slow and not network" -p no:cacheprovider -o faulthandler_timeout=500
-          echo "pytest rc=$?"
-          wait
-          cat ../watchdog.txt
-
-      - name: Dice DDP test alone, 20 times
-        if: always()
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          ok=0; hang=0; fail=0
-          for i in $(seq 1 20); do
-            timeout 120 uv run --no-sync pytest tests/models/training/test_dice_ddp_allgather.py -q -p no:cacheprovider > run.log 2>&1; rc=$?
-            if [ $rc -eq 0 ]; then ok=$((ok+1)); elif [ $rc -eq 124 ]; then hang=$((hang+1)); echo "run $i HANG"; tail -5 run.log; else fail=$((fail+1)); echo "run $i FAIL"; tail -20 run.log; fi
+          SPY="$(pwd)/.venv/bin/py-spy"
+          PY="$(pwd)/.venv/bin/python"
+          cat > ../direct.py <<'EOF'
+          import sys, pathlib; sys.path.insert(0, ".")
+          import tests.models.training.test_dice_ddp_allgather as t
+          import tempfile
+          for name in ("memory_efficient", "soft"):
+              t.test_batch_dice_under_ddp_matches_one_process(pathlib.Path(tempfile.mkdtemp()), name)
+          print("direct ok", flush=True)
+          EOF
+          dumpgrp() {
+            echo "### HANG: process tree"; ps -eo pid,ppid,pgid,stat,etimes,wchan:28,cmd --forest | grep -E "python|pytest|uv" | grep -v grep | cut -c1-260
+            for p in $(pgrep -g "$1"); do echo "== pid $p :: $(tr '\0' ' ' < /proc/$p/cmdline | cut -c1-200)"; sudo "$SPY" dump --pid $p --native 2>&1 | head -60; echo "-- threads wchan:"; for t in /proc/$p/task/*; do echo "$(basename $t) $(cat $t/comm) $(cat $t/wchan)"; done | head -30; done
+          }
+          run() {  # $1 label, rest = command
+            label=$1; shift
+            setsid "$@" > run.log 2>&1 & pid=$!
+            for s in $(seq 1 90); do sleep 1; kill -0 $pid 2>/dev/null || break; done
+            if kill -0 $pid 2>/dev/null; then echo "$label HANG"; tail -20 run.log; dumpgrp $pid; kill -9 -- -$pid; wait $pid; return 2; fi
+            wait $pid; rc=$?; [ $rc -eq 0 ] && return 0; echo "$label FAIL rc=$rc"; tail -30 run.log; return 1
+          }
+          declare -A n
+          for i in $(seq 1 15); do
+            run "pytest#$i" "$PY" -m pytest tests/models/training/test_dice_ddp_allgather.py -v -s -p no:cacheprovider -o faulthandler_timeout=60; r=$?; n[pytest$r]=$((n[pytest$r]+1))
+            run "direct#$i" "$PY" ../direct.py; r=$?; n[direct$r]=$((n[direct$r]+1))
           done
-          echo "alone: ok=$ok hang=$hang fail=$fail"
+          for k in "${!n[@]}"; do echo "$k=${n[$k]}"; done | sort   # 0 ok, 1 fail, 2 hang
