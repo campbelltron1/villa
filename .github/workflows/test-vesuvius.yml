@@ -15,7 +15,7 @@ on:
   # (as in vc3d-ci.yml). Caches written by pull_request runs are scoped to that
   # PR's merge ref, so without main builds every PR compiles from scratch.
   push:
-    branches: [main, ci-vesuvius-sccache-debug]
+    branches: [main, ci-vesuvius-sccache-debug, ci-vesuvius-sccache-nolto-debug]
     paths:
       - 'vesuvius/**'
       - 'lasagna/**'
@@ -51,6 +51,8 @@ jobs:
       # sccache keys, identical between runs (scikit-build-core otherwise builds
       # in a fresh temporary directory).
       SKBUILD_BUILD_DIR: build/{wheel_tag}
+      # debug: measure the warm sync without volume-cartographer's LTO link
+      SKBUILD_CMAKE_DEFINE: VC_USE_LTO=OFF
 
     steps:
       - name: Checkout code
