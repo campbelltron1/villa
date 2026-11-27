@@ -85,35 +85,21 @@ jobs:
         run: |
           hostname; hostname -I || true; getent hosts "$(hostname)" || true; nproc; uv run --no-sync python -c "import sys,torch,multiprocessing as m;print(sys.version, torch.__version__, m.get_start_method())"
 
-      - name: Dice DDP test alone, 15 times each way, stack dumps on a hang
+      - name: Control (main) vs patched dice DDP test, 25 runs each
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set +e
-          SPY="$(pwd)/.venv/bin/py-spy"
           PY="$(pwd)/.venv/bin/python"
-          cat > ../direct.py <<'EOF'
-          import sys, pathlib; sys.path.insert(0, ".")
-          import tests.models.training.test_dice_ddp_allgather as t
-          import tempfile
-          for name in ("memory_efficient", "soft"):
-              t.test_batch_dice_under_ddp_matches_one_process(pathlib.Path(tempfile.mkdtemp()), name)
-          print("direct ok", flush=True)
-          EOF
-          dumpgrp() {
-            echo "### HANG: process tree"; ps -eo pid,ppid,pgid,stat,etimes,wchan:28,cmd --forest | grep -E "python|pytest|uv" | grep -v grep | cut -c1-260
-            for p in $(pgrep -g "$1"); do echo "== pid $p :: $(tr '\0' ' ' < /proc/$p/cmdline | cut -c1-200)"; sudo "$SPY" dump --pid $p --native 2>&1 | head -60; echo "-- threads wchan:"; for t in /proc/$p/task/*; do echo "$(basename $t) $(cat $t/comm) $(cat $t/wchan)"; done | head -30; done
-          }
-          run() {  # $1 label, rest = command
-            label=$1; shift
-            setsid "$@" > run.log 2>&1 & pid=$!
-            for s in $(seq 1 90); do sleep 1; kill -0 $pid 2>/dev/null || break; done
-            if kill -0 $pid 2>/dev/null; then echo "$label HANG"; tail -20 run.log; dumpgrp $pid; kill -9 -- -$pid; wait $pid; return 2; fi
-            wait $pid; rc=$?; [ $rc -eq 0 ] && return 0; echo "$label FAIL rc=$rc"; tail -30 run.log; return 1
+          run() {  # $1 label, $2 test file; returns 0 ok, 1 fail, 2 hang
+            setsid "$PY" -m pytest "$2" -q -p no:cacheprovider > run.log 2>&1 & pid=$!
+            for s in $(seq 1 180); do sleep 1; kill -0 $pid 2>/dev/null || break; done
+            if kill -0 $pid 2>/dev/null; then echo "$1 HANG"; kill -9 -- -$pid; wait $pid; return 2; fi
+            wait $pid; rc=$?; [ $rc -eq 0 ] && return 0; echo "$1 FAIL rc=$rc"; tail -30 run.log; return 1
           }
           declare -A n
-          for i in $(seq 1 15); do
-            run "pytest#$i" "$PY" -m pytest tests/models/training/test_dice_ddp_allgather.py -v -s -p no:cacheprovider -o faulthandler_timeout=60; r=$?; n[pytest$r]=$((n[pytest$r]+1))
-            run "direct#$i" "$PY" ../direct.py; r=$?; n[direct$r]=$((n[direct$r]+1))
+          for i in $(seq 1 25); do
+            run "main#$i" tests/models/training/test_dice_ddp_allgather.py; r=$?; n[main_$r]=$((n[main_$r]+1))
+            run "patched#$i" tests/models/training/test_dice_ddp_allgather_fixed.py; r=$?; n[patched_$r]=$((n[patched_$r]+1))
           done
-          for k in "${!n[@]}"; do echo "$k=${n[$k]}"; done | sort   # 0 ok, 1 fail, 2 hang
+          echo "RESULT (0 ok, 1 fail, 2 hang):"; for k in "${!n[@]}"; do echo "RESULT $k=${n[$k]}"; done | sort
