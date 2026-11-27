@@ -1,6 +1,7 @@
 name: Test vesuvius Python
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - 'vesuvius/**'
@@ -14,7 +15,7 @@ on:
   # (as in vc3d-ci.yml). Caches written by pull_request runs are scoped to that
   # PR's merge ref, so without main builds every PR compiles from scratch.
   push:
-    branches: [main]
+    branches: [main, ci-vesuvius-sccache-debug]
     paths:
       - 'vesuvius/**'
       - 'lasagna/**'
@@ -31,7 +32,7 @@ jobs:
             # Limit the test matrix to ubuntu-latest for now, as other platforms may not
             # support all dependencies yet.  Extend this list once the build scripts
             # for macOS and Windows are confirmed.
-            os: [blacksmith-4vcpu-ubuntu-2404]
+            os: [ubuntu-24.04]
             zarr: ['2.18.7', '3.2.1']
     defaults:
       run:
