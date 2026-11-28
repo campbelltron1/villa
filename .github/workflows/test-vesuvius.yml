@@ -5,9 +5,11 @@ name: Test vesuvius Python
 # 6 h job limit. Runs from other events are never cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}  # debug: fork PRs start no runs, so prove it on push
 
 on:
+  push:
+    branches: [conc-debug]
   pull_request:
     paths:
       - 'vesuvius/**'
